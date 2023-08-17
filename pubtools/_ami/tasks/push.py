@@ -5,13 +5,17 @@ import json
 import attr
 
 from requests import HTTPError
-from more_executors import Executors
+from more_executors import Executors, ExceptionRetryPolicy
 from cloudimg.aws import AWSPublishingMetadata
+from pubtools._ami.task import AmiTask
+
 from ..services import RHSMClientService, AWSPublishService, CollectorService
 from .base import AmiBase
 from .exceptions import AWSPublishError
 
 LOG = logging.getLogger("pubtools.ami")
+
+step = AmiTask.step
 
 
 class AmiPush(AmiBase, RHSMClientService, AWSPublishService, CollectorService):
@@ -47,6 +51,7 @@ class AmiPush(AmiBase, RHSMClientService, AWSPublishService, CollectorService):
                 verified = False
         return verified
 
+    @step("Upload image to AWS")
     # pylint:disable=too-many-locals
     def upload(self, push_item):
         """
@@ -149,6 +154,7 @@ class AmiPush(AmiBase, RHSMClientService, AWSPublishService, CollectorService):
 
         return image.id
 
+    @step("Update RHSM metadata")
     def update_rhsm_metadata(self, image, push_item):
         """Update rhsm with the uploaded image info. First it creates the region of
         the image assuming it returns OK if the region is present. Then tries to update
@@ -217,24 +223,8 @@ class AmiPush(AmiBase, RHSMClientService, AWSPublishService, CollectorService):
             image_id = None
             retries = max_retries
 
-            while True:
-                try:
-                    image_id = self.upload(push_item)
-                    state = "PUSHED"
-                except (HTTPError, AWSPublishError) as exc:
-                    LOG.warning(str(exc))
-                    if retries > 0:
-                        retries -= 1
-                        LOG.info("Retrying upload")
-                        time.sleep(retry_wait)
-                        continue
-                    LOG.error(
-                        "Upload failed after %s attempts. Giving up", (max_retries + 1)
-                    )
-                    state = "NOTPUSHED"
-                # break statement is not covered in py38
-                # https://github.com/nedbat/coveragepy/issues/772
-                break  # pragma: no cover
+            image_id = self.upload(push_item)
+            state = "PUSHED"
             dest_data["push_item"] = attr.evolve(push_item, state=state)
             dest_data["state"] = state
             dest_data["image_id"] = image_id
@@ -290,24 +280,33 @@ class AmiPush(AmiBase, RHSMClientService, AWSPublishService, CollectorService):
         region_data = self.region_data()
 
         # upload
-        executor = Executors.thread_pool(
+        with Executors.thread_pool(
             name="pubtools-ami-push",
             max_workers=min(len(region_data), self._REQUEST_THREADS),
-        )
-        to_await = []
-        result = []
-        for data in region_data:
-            to_await.append(executor.submit(self._push_to_region, data))
+        ).with_retry(
+            logger=LOG,
+            retry_policy=ExceptionRetryPolicy(
+                sleep=self.args.retry_wait,
+                max_attempts=self.args.max_retries,
+                exception_base=(HTTPError, AWSPublishError),
+            ),
+        ) as executor:
 
-        # waiting for results
-        for f_out in to_await:
-            result.extend(f_out.result())
+            to_await = []
+            result = []
+            for data in region_data:
+                to_await.append(executor.submit(self._push_to_region, data))
 
-        # process result for failures
-        failed = False
-        for r in result:
-            if not r.get("image_id"):
-                failed = True
+            # waiting for results
+            for f_out in to_await:
+                result.extend(f_out.result())
+
+            # process result for failures
+            failed = False
+            for r in result:
+                if not r.get("image_id"):
+                    failed = True
+                    r["state"] = "NOTPUSHED"
 
         # send to collector
         LOG.info("Collecting results")
